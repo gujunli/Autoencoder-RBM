@@ -1,0 +1,373 @@
+#include <sys/time.h>
+#include "rbm.h"
+#define KERNEL_SOURCE_LENGTH 50000
+
+// constructor
+RBM_GPU::RBM_GPU(unsigned int deviceIndex, unsigned int vis, unsigned int hid, bool linearity, unsigned numEpoch, unsigned numBatch, unsigned nVecPerBatch, 
+				floatType wCost, floatType initMom, floatType finalMom, string layertag)
+	:RBM(vis, hid, linearity, numEpoch, numBatch, nVecPerBatch, wCost, initMom, finalMom, layertag){
+
+	// initialize the OpenCL environment
+	gpu_init(gpu_env, deviceIndex);
+
+	// allocate device buffers
+	d_weights 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * nHidLayerSize * sizeof(floatType), NULL, &gpu_env.status);
+	d_hidBias 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nHidLayerSize * sizeof(floatType), 				NULL, &gpu_env.status);
+	d_visBias 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * sizeof(floatType), 				NULL, &gpu_env.status);
+	
+	d_delta_weights = clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * nHidLayerSize * sizeof(floatType), 	NULL, &gpu_env.status);
+	d_delta_hidBias = clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nHidLayerSize * sizeof(floatType), 					NULL, &gpu_env.status);
+	d_delta_visBias = clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * sizeof(floatType), 					NULL, &gpu_env.status);
+	
+	d_posHidProbs 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nHidLayerSize * nVectorPerBatch * sizeof(floatType), 	NULL, &gpu_env.status);
+	d_negHidProbs 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nHidLayerSize * nVectorPerBatch * sizeof(floatType), 	NULL, &gpu_env.status);
+	d_posProds 		= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * nHidLayerSize * sizeof(floatType), 	NULL, &gpu_env.status);
+	d_negProds 		= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * nHidLayerSize * sizeof(floatType), 	NULL, &gpu_env.status);
+	d_posData 		= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * nVectorPerBatch * sizeof(floatType), 	NULL, &gpu_env.status);
+	d_negData 		= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * nVectorPerBatch * sizeof(floatType), 	NULL, &gpu_env.status);
+	d_posHidAct 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nHidLayerSize * sizeof(floatType), 					NULL, &gpu_env.status);
+	d_posVisAct 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * sizeof(floatType), 					NULL, &gpu_env.status);
+	d_negHidAct 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nHidLayerSize * sizeof(floatType), 					NULL, &gpu_env.status);
+	d_negVisAct 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * sizeof(floatType), 					NULL, &gpu_env.status);
+	d_posHidStates 	= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nHidLayerSize * nVectorPerBatch * sizeof(floatType), 	NULL, &gpu_env.status);
+	d_error 		= clCreateBuffer(gpu_env.ctx, CL_MEM_READ_WRITE, nVisLayerSize * nVectorPerBatch * sizeof(floatType), 	NULL, &gpu_env.status);
+
+	// copy the initial parameters from host to device
+	gpu_env.status 	= clEnqueueWriteBuffer(gpu_env.queue, d_weights, 		CL_TRUE, 0, nVisLayerSize * nHidLayerSize * sizeof(floatType), 	(void*)weights, 0, NULL, NULL);
+	gpu_env.status 	= clEnqueueWriteBuffer(gpu_env.queue, d_hidBias, 		CL_TRUE, 0, nHidLayerSize * sizeof(floatType), 					(void*)hidBias, 0, NULL, NULL);
+	gpu_env.status 	= clEnqueueWriteBuffer(gpu_env.queue, d_visBias, 		CL_TRUE, 0, nVisLayerSize * sizeof(floatType), 					(void*)visBias, 0, NULL, NULL);
+	gpu_env.status 	= clEnqueueWriteBuffer(gpu_env.queue, d_delta_weights, 	CL_TRUE, 0, nVisLayerSize * nHidLayerSize * sizeof(floatType), 	(void*)delta_weights, 0, NULL, NULL);
+	gpu_env.status 	= clEnqueueWriteBuffer(gpu_env.queue, d_delta_hidBias, 	CL_TRUE, 0, nHidLayerSize * sizeof(floatType), 					(void*)delta_hidBias, 0, NULL, NULL);
+	gpu_env.status 	= clEnqueueWriteBuffer(gpu_env.queue, d_delta_visBias, 	CL_TRUE, 0, nVisLayerSize * sizeof(floatType), 					(void*)delta_visBias, 0, NULL, NULL);
+	gpu_env.status 	= clEnqueueWriteBuffer(gpu_env.queue, d_error, 			CL_TRUE, 0, nVisLayerSize * sizeof(floatType), 					(void*)error, 0, NULL, NULL);
+
+	// runtime compile OpenCL kernel source file
+	char* source = new char[KERNEL_SOURCE_LENGTH];
+	loadKernelSource("../src/gpu_rbm.cl", source);
+	gpu_env.prog = clCreateProgramWithSource(gpu_env.ctx, 1, (const char**)&source, NULL, &gpu_env.status);
+
+	// build OpenCL program
+	gpu_env.status = clBuildProgram(gpu_env.prog, 0, NULL, NULL, NULL, NULL);
+	if (gpu_env.status == CL_BUILD_PROGRAM_FAILURE) {
+		// Determine the size of the log
+		size_t log_size;
+		clGetProgramBuildInfo(gpu_env.prog, gpu_env.device, CL_PROGRAM_BUILD_LOG, 0, NULL, &log_size);
+
+		// Allocate memory for the log
+		char *log = (char *) malloc(log_size);
+
+		// Get the log
+		clGetProgramBuildInfo(gpu_env.prog, gpu_env.device, CL_PROGRAM_BUILD_LOG, log_size, log, NULL);
+
+		// Print the log
+		printf("%s\n", log);
+		
+		exit(0);
+	}
+
+	// create OpenCL kernels 
+	squareError		= clCreateKernel(gpu_env.prog, "squareError", &gpu_env.status);
+	sigmoid			= clCreateKernel(gpu_env.prog, "sigmoid", &gpu_env.status);
+	addBias			= clCreateKernel(gpu_env.prog, "addBias", &gpu_env.status);
+	sumBatch		= clCreateKernel(gpu_env.prog, "sumBatch", &gpu_env.status);
+	add				= clCreateKernel(gpu_env.prog, "add", &gpu_env.status);
+	getStates		= clCreateKernel(gpu_env.prog, "getStates", &gpu_env.status);
+	updateWeights	= clCreateKernel(gpu_env.prog, "updateWeights", &gpu_env.status);
+	updateBias		= clCreateKernel(gpu_env.prog, "updateBias", &gpu_env.status);
+	randNum			= clCreateKernel(gpu_env.prog, "PRNG_threefry4x32", &gpu_env.status);
+	randn			= clCreateKernel(gpu_env.prog, "PRNGn_threefry4x32", &gpu_env.status);
+	reset			= clCreateKernel(gpu_env.prog, "reset", &gpu_env.status);
+
+	// Random initialization of RBM weights
+	if(linear){
+		gpu_gaussInit(gpu_env, randn, d_weights, nVisLayerSize * nHidLayerSize, 0.0, 0.1, NULL);
+	}
+	else{
+		gpu_gaussInit(gpu_env, randn, d_weights, nVisLayerSize * nHidLayerSize, 0.0, 0.01, NULL);
+	}
+}
+
+
+/*
+ * Calculate the probability values of hidden layer neurons, d_posHidProbs, using the input data
+ * Also, compute the product of the probability vector and the input data vector, to generate the matrix d_posProds, for updating the weights.
+*/
+void RBM_GPU::posProp(){
+
+	// add the bias vector to each hidden vector in one mini-batch
+	gpu_addBias(gpu_env, addBias, d_posHidProbs, d_hidBias, nHidLayerSize, nVectorPerBatch, NULL);
+
+	// add the weighted sums of the input data to the hidden vectors, thus, net = W * v + b
+	gpu_env.status = clAmdBlasSgemm(gpu_env.order, clAmdBlasNoTrans, clAmdBlasNoTrans, nHidLayerSize, nVectorPerBatch, nVisLayerSize, 1.0, d_weights, nHidLayerSize, d_posData, nVisLayerSize, 1.0, d_posHidProbs, nHidLayerSize, 1, &gpu_env.queue, 0, NULL, NULL);
+
+	// sigmoid activation function, h = sigmoid(net) = sigmoid(W * v + b)
+	gpu_sigmoid(gpu_env, sigmoid, d_posHidProbs, nHidLayerSize * nVectorPerBatch, NULL);
+
+	// calculate the product for updating the weights in the contrastive divergence training, posProds = h * v'
+	gpu_env.status = clAmdBlasSgemm(gpu_env.order, clAmdBlasNoTrans, clAmdBlasTrans, nHidLayerSize, nVisLayerSize, nVectorPerBatch, 1.0, d_posHidProbs, nHidLayerSize, d_posData, 
+		nVisLayerSize, 0.0, d_posProds, nHidLayerSize, 1, &gpu_env.queue, 0, NULL, NULL);
+
+	// calculate the sum of activations of data values and probability values for updating the biases in the contrastive divergence training.
+	// reduce the data values and probabilty values of a mini-batch to one single vector respectively.
+	gpu_sumBatch(gpu_env, sumBatch, d_posData, d_posVisAct, nVisLayerSize, nVectorPerBatch, NULL);
+	gpu_sumBatch(gpu_env, sumBatch, d_posHidProbs, d_posHidAct, nHidLayerSize, nVectorPerBatch, NULL);
+
+	return;
+}
+
+/*
+ * Generate the binary states of the hidden layer.
+ * The state of each neuron in the hidden layer follows the Bernoulli distribution, 
+ * which means P(d_posHidStates[i] = 1) = d_posHidProbs[i], P(d_posHidStates[i] = 0) = (1 - d-posHidProbs[i]).
+*/
+void RBM_GPU::generateStates(){
+
+	// produce uniform distributed numbers in the span (0, 1)
+	gpu_randomInit(gpu_env, randNum, d_posHidStates, nHidLayerSize * nVectorPerBatch, 0.0, 1.0, NULL);
+	// sample the states according to the distribution
+	gpu_getStates(gpu_env, getStates, d_posHidStates, d_posHidProbs, nHidLayerSize * nVectorPerBatch, NULL);
+	
+	return;
+}
+
+
+/*
+ * Sample a reconstructed data given the hidden layer and calculate the probability values of hidden layer neurons, d_negHidProbs, using the reconstructed data
+ * Also, compute the product of the probability vector and the reconstructed data vector, to generate the matrix d_negProds, for updating the weights.
+*/
+void RBM_GPU::negProp(){
+	// for the 1st visible layer, the v' will be reconstructed by using a Gaussian distribution (for GB-RBM model) or exclusively a Bernoulli distribution (for BB-RBM model).
+
+	// return a matrix of row vectors
+	if(linear){	
+		// Gaussian-Bernoulli RBM
+		gpu_addBias(gpu_env, addBias, d_negData, d_visBias, nVisLayerSize, nVectorPerBatch, NULL);
+	}
+	else{
+		// Bernoulli-Bernoulli RBM
+		gpu_addBias(gpu_env, addBias, d_negData, d_visBias, nVisLayerSize, nVectorPerBatch, NULL);
+	}
+
+
+	// back-propagate using the estimated states of the hidden layer (from the hidden layer to the visible layer)
+	gpu_env.status = clAmdBlasSgemm(gpu_env.order, clAmdBlasTrans, clAmdBlasNoTrans, nVisLayerSize, nVectorPerBatch, nHidLayerSize, 1.0, 
+		d_weights, nHidLayerSize, d_posHidStates, nHidLayerSize, 1.0, d_negData, nVisLayerSize, 1, &gpu_env.queue, 0, NULL, NULL);	
+
+
+	// return the probability values of those units in the visible layer
+	if(!linear){
+		// only available for Bernoulli-Bernoulli RBM
+		gpu_sigmoid(gpu_env, sigmoid, d_negData, nVisLayerSize * nVectorPerBatch, NULL);
+	}	
+
+	// forth-propagate using the reconstructed visible state (from the visible layer to the hidden layer)
+	gpu_addBias(gpu_env, addBias, d_negHidProbs, d_hidBias, nHidLayerSize, nVectorPerBatch, NULL);
+	gpu_env.status = clAmdBlasSgemm(gpu_env.order, clAmdBlasNoTrans, clAmdBlasNoTrans, nHidLayerSize, nVectorPerBatch, nVisLayerSize, 1.0, 
+		d_weights, nHidLayerSize, d_negData, nVisLayerSize, 1.0, d_negHidProbs, nHidLayerSize, 1, &gpu_env.queue, 0, NULL, NULL);
+
+	// return the probability values of the units in the hidden layer
+	gpu_sigmoid(gpu_env, sigmoid, d_negHidProbs, nHidLayerSize * nVectorPerBatch, NULL);
+
+	// return the product of the reconstructed values of the visible units and their probability values of the hidden-layer units
+	gpu_env.status = clAmdBlasSgemm(gpu_env.order, clAmdBlasNoTrans, clAmdBlasTrans, nHidLayerSize, nVisLayerSize, nVectorPerBatch, 1.0,
+		d_negHidProbs, nHidLayerSize, d_negData, nVisLayerSize, 0.0, d_negProds, nHidLayerSize, 1, &gpu_env.queue, 0, NULL, NULL);
+
+	// collapse the probability matrix 'd_negHidProbs' into a row vector at the hidden layer
+	gpu_sumBatch(gpu_env, sumBatch, d_negHidProbs, d_negHidAct, nHidLayerSize, nVectorPerBatch, NULL);
+	// collapse the state matrix 'd_negData' into a row vector at the visible layer
+	gpu_sumBatch(gpu_env, sumBatch, d_negData, d_negVisAct, nVisLayerSize, nVectorPerBatch, NULL);
+
+	return;
+}
+
+/*
+ * Update the weight and bias parameters of the RBM network using the contrastive divergence method
+*/
+void RBM_GPU::update(){
+
+	gpu_updateWeights(gpu_env, updateWeights, d_weights, d_delta_weights, d_posProds, d_negProds, momentum, eps_w, weightCost, nVisLayerSize, nHidLayerSize, nVectorPerBatch, NULL);
+	gpu_updateBias(gpu_env, updateBias, d_visBias, d_delta_visBias, d_posVisAct, d_negVisAct, momentum, eps_vb, nVisLayerSize, nVectorPerBatch, NULL);
+	gpu_updateBias(gpu_env, updateBias, d_hidBias, d_delta_hidBias, d_posHidAct, d_negHidAct, momentum, eps_hb, nHidLayerSize, nVectorPerBatch, NULL);
+
+	return;
+}
+
+/*
+ * Train the RBM network
+*/
+void RBM_GPU::train(){
+	posData = new floatType[nVisLayerSize * nVectorPerBatch];
+
+	for(int epoch = 0; epoch <nEpochNum; epoch++){
+		dataprovider->reset();
+		double errsum = 0.0;
+		gpu_reset(gpu_env, reset, d_error, nVisLayerSize * nVectorPerBatch, NULL);	
+		printf("Epoch %d\n", epoch + 1);
+		momentum = (epoch < 5) ? initialMomentum : finalMomentum;
+		for(int batch = 0; batch < nBatchNum; batch++){
+			if((batch + 1) % 100000 == 0){
+				printf("Epoch %d Batch %d\n", epoch + 1, batch + 1);
+			}
+
+			dataprovider->getNextDeviceBatch(d_posData);
+			posProp();
+			generateStates();
+			negProp();
+			gpu_squareError(gpu_env, squareError, d_posData, d_negData, d_error, nVisLayerSize * nVectorPerBatch);
+			update();
+
+			clFlush(gpu_env.queue);
+		}
+		gpu_env.status = clEnqueueReadBuffer(gpu_env.queue, d_error, CL_TRUE, 0, nVisLayerSize * nVectorPerBatch * sizeof(floatType), (void*)error, 0, NULL, NULL);
+		for(int i = 0; i < nVisLayerSize * nVectorPerBatch; i++){
+		 	errsum += error[i];
+		}
+
+		// update the info in the command window for monitoring
+		printf("Epoch %d Error %f\n", epoch + 1, errsum);
+
+		ofstream fout;
+		fout.open("../log/errorLog.log", ios_base::app);
+		struct timeval now;
+		gettimeofday(&now, NULL);
+		fout << now.tv_sec << ',' << errsum << endl;
+		fout.close();
+
+		// save the network parameters in the host memory at each epoch
+ 		gpu_env.status = clEnqueueReadBuffer(gpu_env.queue, d_weights, CL_TRUE, 0, nVisLayerSize * nHidLayerSize * sizeof(floatType), (void*)weights, 0, NULL, NULL);
+		gpu_env.status = clEnqueueReadBuffer(gpu_env.queue, d_hidBias, CL_TRUE, 0, nHidLayerSize * sizeof(floatType), (void*)hidBias, 0, NULL, NULL);
+		gpu_env.status = clEnqueueReadBuffer(gpu_env.queue, d_visBias, CL_TRUE, 0, nVisLayerSize * sizeof(floatType), (void*)visBias, 0, NULL, NULL);
+
+		if(epoch == nEpochNum - 1){
+			string dataWeightName = dataTag;
+			dataWeightName.append("Weight.dat");
+			fout.open(dataWeightName.c_str(), ios_base::binary | ios_base::trunc);
+			fout.write((char*)weights, nVisLayerSize * nHidLayerSize * sizeof(floatType));
+			fout.close();
+
+			string dataHidBiasName = dataTag;
+			dataHidBiasName.append("HidBias.dat");
+			fout.open(dataHidBiasName.c_str(), ios_base::binary | ios_base::trunc);
+			fout.write((char*)hidBias, nHidLayerSize * sizeof(floatType));
+			fout.close();
+
+			string dataVisBiasName = dataTag;
+			dataVisBiasName.append("VisBias.dat");
+			fout.open(dataVisBiasName.c_str(), ios_base::binary | ios_base::trunc);
+			fout.write((char*)visBias, nVisLayerSize * sizeof(floatType));
+			fout.close();			
+		}
+		// save these parameters into the disc.
+		string logWeightFileName = logTag;
+		logWeightFileName.append("Weight");
+		generateFileName(&logWeightFileName, epoch, 3);
+		logData(logWeightFileName, weights, nVisLayerSize * nHidLayerSize, nHidLayerSize, 1);
+
+		string logHidBiasFileName = logTag;
+		logHidBiasFileName.append("HidBias");
+		generateFileName(&logHidBiasFileName, epoch, 3);
+		logData(logHidBiasFileName, hidBias, nHidLayerSize, nHidLayerSize, 1);
+
+		string logVisBiasFileName = logTag;
+		logVisBiasFileName.append("VisBias");
+		generateFileName(&logVisBiasFileName, epoch, 3);
+		logData(logVisBiasFileName, visBias, nVisLayerSize, nVisLayerSize, 1);
+	}
+
+}
+
+/*
+ * Get the hidden probability values using the trained RBM
+*/
+void RBM_GPU::test(){
+	// load connection weight matrix and the hidden layer bias vector
+	ifstream fin;
+	string testWeightName = dataTag;
+	testWeightName.append("Weight.dat");
+	fin.open(testWeightName.c_str(), ios_base::binary);
+	fin.read((char*)weights, nVisLayerSize * nHidLayerSize * sizeof(floatType));
+	fin.close();
+	
+	string testHidBiasName = dataTag;
+	testHidBiasName.append("HidBias.dat");
+	fin.open(testHidBiasName.c_str(), ios_base::binary);
+	fin.read((char*)hidBias, nHidLayerSize * sizeof(floatType));
+	fin.close();
+
+	// write the above parameters to the device
+ 	gpu_env.status = clEnqueueWriteBuffer(gpu_env.queue, d_weights, CL_TRUE, 0, nVisLayerSize * nHidLayerSize * sizeof(floatType),	(void*)weights, 0, NULL, NULL);
+	gpu_env.status = clEnqueueWriteBuffer(gpu_env.queue, d_hidBias, CL_TRUE, 0, nHidLayerSize * sizeof(floatType), 			(void*)hidBias, 0, NULL, NULL);
+
+
+	posData = new floatType[nVisLayerSize * nVectorPerBatch];
+
+	// propagate forward
+	{
+		dataprovider->reset();
+		double errsum = 0.0;
+		gpu_reset(gpu_env, reset, d_error, nVisLayerSize * nVectorPerBatch, NULL);	
+
+		for(int batch = 0; batch < nBatchNum; batch++)
+		{
+			dataprovider->getNextDeviceBatch(d_posData);
+
+			// forth-propagate from the visible layer to the hidden layer
+			gpu_addBias(gpu_env, addBias, d_posHidProbs, d_hidBias, nHidLayerSize, nVectorPerBatch, NULL);
+			gpu_env.status = clAmdBlasSgemm(gpu_env.order, clAmdBlasNoTrans, clAmdBlasNoTrans, nHidLayerSize, nVectorPerBatch, nVisLayerSize, 1.0, 
+				d_weights, nHidLayerSize, d_posData, nVisLayerSize, 1.0, d_posHidProbs, nHidLayerSize, 1, &gpu_env.queue, 0, NULL, NULL);
+			gpu_sigmoid(gpu_env, sigmoid, d_posHidProbs, nHidLayerSize * nVectorPerBatch, NULL);
+
+			// flush the command queue to execute the commands and read the result back to the host
+			gpu_env.status = clEnqueueReadBuffer(gpu_env.queue, d_posHidProbs, CL_TRUE, 0, nHidLayerSize * nVectorPerBatch * sizeof(floatType), (void*)posHidProbs, 0, NULL, NULL);
+
+			// save the result into the disc
+			ofstream fout;
+			string testProbName = dataTag;
+			testProbName.append("Prob.dat");
+			fout.open(testProbName.c_str(), ios_base::binary | ios_base::app);
+			fout.write((char*)posHidProbs, nHidLayerSize * nVectorPerBatch * sizeof(floatType));
+		}
+	}
+}
+
+void RBM_GPU::gpu_release(){
+	// destroy cl_mem objects
+	clReleaseMemObject(d_weights);
+	clReleaseMemObject(d_hidBias);
+	clReleaseMemObject(d_visBias);
+
+	clReleaseMemObject(d_delta_weights);
+	clReleaseMemObject(d_delta_hidBias);
+	clReleaseMemObject(d_delta_visBias);
+
+	clReleaseMemObject(d_posHidProbs);
+	clReleaseMemObject(d_negHidProbs);	
+	clReleaseMemObject(d_posProds);
+	clReleaseMemObject(d_negProds);
+	clReleaseMemObject(d_posData);
+	clReleaseMemObject(d_negData);
+	clReleaseMemObject(d_posHidAct);
+	clReleaseMemObject(d_posVisAct);
+	clReleaseMemObject(d_negHidAct);
+	clReleaseMemObject(d_negVisAct);
+	clReleaseMemObject(d_posHidStates);
+	clReleaseMemObject(d_error);
+	
+	// destroy OpenCL kernels
+	clReleaseKernel(squareError);
+	clReleaseKernel(sigmoid);
+	clReleaseKernel(addBias);
+	clReleaseKernel(sumBatch);
+	clReleaseKernel(add);
+	clReleaseKernel(getStates);
+	clReleaseKernel(updateWeights);
+	clReleaseKernel(updateBias);
+	clReleaseKernel(randNum);
+	clReleaseKernel(randn);
+	clReleaseKernel(reset);
+	
+}
+
+RBM_GPU::~RBM_GPU(){
+	gpu_release();
+};

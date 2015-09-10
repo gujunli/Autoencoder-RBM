@@ -1,0 +1,140 @@
+#ifndef _CIFAR10_H_
+#define _CIFAR10_H_
+
+#include "utils.h"
+#include <string>
+#include <fstream>
+
+void generateFileName(string* prefix, unsigned index, unsigned nDigitNum);
+string generateFileName(const string& prefix, unsigned index, unsigned nDigitNum);
+
+typedef unsigned char byte;
+
+class cifarPreProcessor
+{
+private:
+	unsigned int nPixelPerRow;
+	unsigned int nPixelPerColumn;
+	unsigned int nImageNum;
+	unsigned int nPatchNum;
+	unsigned int nPatchFileNum;
+	unsigned int nPatchLength;
+	unsigned char* rawData;
+	unsigned char* patchData;
+	unsigned char* labels;
+	string rawDataFileName;
+	string patchDataFileName;
+public:
+	cifarPreProcessor(string rawfile, string patchfile);
+	~cifarPreProcessor(){};
+
+	/*
+	 * Translate CIFAR-10 images to image patches.
+	*/
+	void makePatchData();
+	void makePatchDataFiles();
+};
+
+/*
+ *	The data shuffler is designed for re-permutating the original data files and 
+ *	save the shuffled files to disc. Call the function run() to execute.
+*/
+
+class datashuffler
+{
+private:
+	// hyper-parameters
+	unsigned 	totalVectorCount;		// the total number of vectors in all files
+	unsigned 	fileCount;				// the number of files
+	unsigned 	vectorCountPerFile;		// the number of vectors in each file
+	unsigned	vectorLength;			// the length (in bytes) of each vector
+	
+	// data buffers
+	unsigned	*newGlobalIndex;		// map the ith vector to the position of newIndex[i]
+	unsigned	*vecIndexInFile;		// the index of a vector in the corresponding file
+	unsigned	*fileIndex;				// the index of the file to which a vector belongs
+	byte		*inputBuffer;			// buffer for an input file
+	byte		*outputBuffer;			// buffer for an output file
+	
+	string 		inputPrefix;
+	string 		medPrefix;
+	string 		outputPrefix;
+	
+	
+public:
+
+	datashuffler(const string& fileNamePrefix, unsigned numVec, unsigned numFile, unsigned vecLen);
+	~datashuffler();
+	
+	/*
+	 * Generate a new permutation using Knuth shuffling algorithm.
+	 * Call this function to get newGlobalIndex, vecIndexInFile and fileIndex.
+	*/
+	void genNewPerm(void);
+	/*
+	 * Read an input file from disk to the memory inputBuffer.
+	 * fname is the name of the input file.
+	*/
+	void loadInputFile(const string& fname);
+	/*
+	 * The function generateMedFile() creates medium files
+	 * and form the mapping table src2med at the same time.
+	*/
+	void generateMedFile(void);
+	/*
+	 * Process the medium files to generate output files
+	 * with the help of src2med.
+	*/
+	void procMedFile(void);
+
+	/*
+	 * The entry function.
+	*/
+	void run(void);	
+};
+
+class dataProvider
+{
+protected:
+	string dataFileNamePrefix;
+	unsigned int nBatchNum; // total number of mini-batches
+	unsigned int nDataPerBatch; // total number of patch images in a mini-batch
+	unsigned int nDataPerFile; // total number of patch images in a file
+	unsigned int nBatchInBuffer; // the number of mini-batches loaded in host memory
+	unsigned int currentDataId; // the patch index in all the training patch images
+	unsigned int currentBatchId; // the batch index
+	unsigned int currentFileId; // the file index
+	unsigned int nPixelPerData; // total number of pixels in a patch image
+	bool floatPoint; // true - 4 Bytes / false - 1 Byte
+	
+	floatType* 	mean;
+	floatType* 	variance;
+	floatType* 	batchDataBuffer;
+	unsigned*	shuffledId;
+
+public:
+	dataProvider(string prefix, unsigned pixelperdata, unsigned batchSize, bool floatpoint);
+	void reset();
+	void getExpectation();
+	void getStat();
+	void loadFloatFileToBuffer();
+	void loadByteFileToBuffer();
+	void shuffleDataInBuffer();
+	inline unsigned int getBatchNum(){return nBatchNum;};
+	floatType* getNextBatch();
+
+};
+
+class dataProvider_GPU : public dataProvider{
+private:
+	CL_ENV cl_env;
+	cl_mem batchDataDeviceBuffer;
+
+public:
+	dataProvider_GPU(CL_ENV env, string prefix, unsigned pixelperdata, unsigned batchSize, bool floatpoint);
+	void loadDeviceBufferFromHost();
+	void getNextDeviceBatch(cl_mem&);
+};
+
+
+#endif
